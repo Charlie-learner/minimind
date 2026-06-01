@@ -1,10 +1,16 @@
+import math
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from typing import Optional, Tuple, List, Union
 from transformers import PretrainedConfig
 
+
 #################################################################
-# MiniMind Config
+# CharlieMind Config
 #################################################################
-class MokioMindConfig(PretrainedConfig):
-    model_type = "mokiomind"
+class CharlieMindConfig(PretrainedConfig):
+    model_type = "charliemind"
 
     def __init__(
         self,
@@ -75,11 +81,8 @@ class MokioMindConfig(PretrainedConfig):
 
 
 #################################################################
-# MiniMind Model
+# CharlieMind Model
 #################################################################
-import torch
-import torch.nn as nn
-
 class RMSNorm(nn.Module):
     def __init__(self, dim:int, eps:float=1e-5):
         super().__init__()
@@ -165,3 +168,93 @@ def apply_rotary_pos_emb(q, k, cos, sin, unsqueeze_dim=1):
     k_embed = ((k * cos.unsqueeze(unsqueeze_dim)) + (rotate_half(k) * sin.unsqueeze(unsqueeze_dim))).to(k.dtype)
 
     return q_embed, k_embed
+
+
+def repeate_kv(x: torch.Tensor, num_repeats: int):
+    # x: [batch_size, seq_len, num_heads, head_dim]
+    bsz, seq_len, num_heads, head_dim = x.shape
+    if num_repeats == 1:
+        return x    
+
+    return (x.unsqueeze(3).expand(-1, -1, -1, num_repeats, -1).reshape(bsz, seq_len, num_heads * num_repeats, head_dim))
+
+
+class Attention(nn.Module):
+    def __init__(self, config:CharlieMindConfig):
+        super().__init__()
+        
+        self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
+        
+        assert config.num_attention_heads % self.num_key_value_heads == 0, "num_attention_heads must be divisible by num_key_value_heads"
+        
+        self.n_local_heads = config.num_attention_heads  # 此处由于是单卡，所以没有除以 world_size，保持和 num_attention_heads 一致
+        self.n_local_kv_heads = self.num_key_value_heads
+        self.n_repeats = self.n_local_heads // self.n_local_kv_heads
+        self.head_dim = config.hidden_size // config.num_attention_heads
+        
+        self.is_casual = True
+        
+        self.q_proj = nn.Linear(config.hidden_size, self.num_attention_heads * self.head_dim, bias = False)
+        self.k_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
+        self.v_proj = nn.Linear(config.hidden_size, self.num_key_value_heads * self.head_dim, bias = False)
+        self.o_proj = nn.Linear(config.num_attention_heads * self.head_dim, config.hidden_size, bias = False)
+        
+        self.q_norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.k_norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.residual_dropout = nn.Dropout(config.dropout)
+        self.dropout = config.dropout
+
+        self.flash = hasattr(torch.nn.functional, "scaled_dot_product_attention") and config.flash_attention
+
+    def forward(self, x: torch.Tensor, position_embeddings: Tuple[torch.Tensor, torch.Tensor], past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, use_cache = False, attention_mask: Optional[torch.Tensor] = None):
+        bsz, seq_len, _ = x.shape
+        # 1. 线性投影得到查询、键、值向量，并调整形状以适配多头注意力机制
+        xq, xk, xv = self.q_proj(x), self.k_proj(x), self.v_proj(x)
+        xq = xq.view(bsz, seq_len, self.n_local_heads, self.head_dim)
+        xk = xk.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        xv = xv.view(bsz, seq_len, self.n_local_kv_heads, self.head_dim)
+        
+        xq, xk = self.q_norm(xq), self.k_norm(xk)
+
+        # 2. 计算 RoPE 位置编码并应用到查询向量和键向量上
+        cos, sin = position_embeddings
+        xq, xk = apply_rotary_pos_emb(xq, xk, cos, sin)
+
+        # 3. kv_cache实现
+        if past_key_value is not None:
+            xk = torch.cat([past_key_value[0], xk], dim=1)
+            xv = torch.cat([past_key_value[1], xv], dim=1)
+        past_kv = (xk, xv) if use_cache else None
+        
+        # 4. 重复键值向量以匹配查询向量的头数（如果 n_repeats > 1），并调整形状以适配注意力计算
+        xq, xk, xv = (xq.transpose(1, 2), repeate_kv(xk, self.n_repeats).transpose(1, 2), repeate_kv(xv, self.n_repeats).transpose(1, 2))
+
+        # 5. 计算注意力输出。根据条件选择使用 Flash Attention 或标准的缩放点积注意力计算。
+        if self.flash and (seq_len > 1) and (not self.is_casual or past_key_vaue is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+            output = F.scaled_dot_product_attention(xq, xk, xv, dropout = self.dropout if self.training else 0.0, is_causal = self.is_casual)
+        else:
+            scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if self.is_casual:
+                scores[..., -seq_len:] += torch.triu(torch.full((seq_len, seq_len), float("-inf"), device = scores.device), diagonal = 1)
+            if attention_mask is not None:
+                scores += (1.0 - attention_mask.unsqueeze(1).unsqueeze(2)) * float("-inf")
+            output = self.attn_dropout(F.softmax(scores.float(), dim = -1).type_as(xv)) @ xv
+        
+        # 6. 将多头注意力输出重新组合并通过输出投影层，得到最终的注意力输出，并返回输出和新的 kv_cache。
+        output = output.transpose(1, 2).contiguous().view(bsz, seq_len, self.n_local_heads * self.head_dim)
+        output = self.residual_dropout(self.o_proj(output))
+        
+        return output, past_kv
+    
+
+
+        
+
+
+        
+
+
+
+
