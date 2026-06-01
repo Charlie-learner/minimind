@@ -4,7 +4,7 @@ import torch.nn.functional as F
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 from transformers import PretrainedConfig
-
+from transformers.activations import ACT2FN
 
 #################################################################
 # CharlieMind Config
@@ -249,8 +249,25 @@ class Attention(nn.Module):
         return output, past_kv
     
 
+class FeedForward(nn.Module):
+    # 初始化、升维、降维、门控、激活函数、dropout
+    def __init__(self, config:CharlieMindConfig):
+        super().__init__()
 
-        
+        if config.intermediate_size is None:
+            intermediate_size = int(config.hidden_size * 8 / 3)
+            config.intermediate_size = 64 * ((intermediate_size + 64 - 1) // 64)
+
+        self.gate_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias = False)
+        self.up_proj = nn.Linear(config.hidden_size, config.intermediate_size, bias = False)
+        self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias = False)
+        self.act_fn = ACT2FN[config.hidden_act]
+        self.dropout == nn.Dropout(config.dropout)
+
+    def forward(self, x: torch.Tensor):
+        return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
+
+
 
 
         
