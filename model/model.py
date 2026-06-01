@@ -7,10 +7,10 @@ from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
 
 #################################################################
-# CharlieMind Config
+# MiniMind Config
 #################################################################
-class CharlieMindConfig(PretrainedConfig):
-    model_type = "charliemind"
+class MiniMindConfig(PretrainedConfig):
+    model_type = "minimind"
 
     def __init__(
         self,
@@ -81,7 +81,7 @@ class CharlieMindConfig(PretrainedConfig):
 
 
 #################################################################
-# CharlieMind Model
+# MiniMind Model
 #################################################################
 class RMSNorm(nn.Module):
     def __init__(self, dim:int, eps:float=1e-5):
@@ -180,7 +180,7 @@ def repeate_kv(x: torch.Tensor, num_repeats: int):
 
 
 class Attention(nn.Module):
-    def __init__(self, config:CharlieMindConfig):
+    def __init__(self, config:MiniMindConfig):
         super().__init__()
         
         self.num_key_value_heads = config.num_attention_heads if config.num_key_value_heads is None else config.num_key_value_heads
@@ -251,7 +251,7 @@ class Attention(nn.Module):
 
 class FeedForward(nn.Module):
     # 初始化、升维、降维、门控、激活函数、dropout
-    def __init__(self, config:CharlieMindConfig):
+    def __init__(self, config:MiniMindConfig):
         super().__init__()
 
         if config.intermediate_size is None:
@@ -267,6 +267,40 @@ class FeedForward(nn.Module):
     def forward(self, x: torch.Tensor):
         return self.dropout(self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x)))
 
+# MiniMind Block 是一个 Transformer 块，包含一个自注意力层和一个前馈网络层。它还包括两个 RMSNorm 层，分别在输入和注意力输出后进行归一化。前馈网络可以选择使用 MoE（Mixture of Experts）版本，以增加模型容量和表达能力。
+class MiniMindBlock(nn.Module):
+    def __init__(self, layer_id: int, config: MiniMindConfig):
+        super().__init__()
+
+        self.self_attn = Attention(config)
+        self.input_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        self.mlp = FeedForward(config) if not config.use_moe else MoEFeedForward(config)
+        self.input_layernorm
+
+    def forward(
+            self, 
+            hidden_states, 
+            position_embeddings: Tuple[torch.Tensor, torch.Tensor], 
+            past_key_value: Optional[Tuple[torch.Tensor, torch.Tensor]] = None, 
+            use_cache=False, 
+            attention_mask: Optional[torch.Tensor] = None
+    ):
+        residual = hidden_states
+        hidden_states, present_key_value = self.self_attn(
+            self.input_layernorm(hidden_states), 
+            position_embeddings = position_embeddings,
+            past_key_value = past_key_value,
+            use_cache = use_cache,
+            attention_mask = attention_mask,
+        )
+
+        # 注意力输出与残差连接相加后，再经过一个前馈网络层和第二个残差连接，得到最终的块输出。
+        hidden_states = residual + hidden_states
+        hidden_states = hidden_states + self.mlp(self.post_attention_layernorm(hidden_states))
+
+        return hidden_states, present_key_value
+        
 
 
 
