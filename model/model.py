@@ -232,7 +232,7 @@ class Attention(nn.Module):
         xq, xk, xv = (xq.transpose(1, 2), repeate_kv(xk, self.n_repeats).transpose(1, 2), repeate_kv(xv, self.n_repeats).transpose(1, 2))
 
         # 5. 计算注意力输出。根据条件选择使用 Flash Attention 或标准的缩放点积注意力计算。
-        if self.flash and (seq_len > 1) and (not self.is_casual or past_key_vaue is None) and (attention_mask is None or torch.all(attention_mask == 1)):
+        if self.flash and (seq_len > 1) and (not self.is_casual or past_key_value is None) and (attention_mask is None or torch.all(attention_mask == 1)):
             output = F.scaled_dot_product_attention(xq, xk, xv, dropout = self.dropout if self.training else 0.0, is_causal = self.is_casual)
         else:
             scores = (xq @ xk.transpose(-2, -1)) / math.sqrt(self.head_dim)
