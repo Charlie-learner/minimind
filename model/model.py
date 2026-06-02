@@ -5,81 +5,48 @@ import torch.nn as nn
 from typing import Optional, Tuple, List, Union
 from transformers import PretrainedConfig
 from transformers.activations import ACT2FN
+from transformers.generation_utils import GenerationMixin
+from transformers.modeling_outputs import CausalLMOutputWithPast
 
 #################################################################
 # MiniMind Config
 #################################################################
 class MiniMindConfig(PretrainedConfig):
     model_type = "minimind"
-
-    def __init__(
-        self,
-        dropout: float = 0.0,
-        bos_token_id: int = 1,
-        eos_token_id: int = 2,
-        hidden_act: str = "silu",
-        hidden_size: int = 512,
-        intermediate_size: int = None,
-        max_position_embeddings: int = 32768,
-        num_attention_heads: int = 8,
-        num_hidden_layers: int = 8,
-        num_key_value_heads: int = 2,
-        vocab_size: int = 6400,
-        rms_norm_eps: float = 1e-05,
-        rope_theta: int = 1000000,
-        inference_rope_scaling: bool = False,
-        flash_attention: bool = True,
-        ############ MoE ############
-        use_moe: bool = False,
-        num_experts_per_tok: int = 2,
-        n_routed_experts: int = 4,
-        n_shared_experts: int = 1,
-        scoring_func: str = "softmax",
-        aux_loss_alpha: float = 0.01,
-        seq_aux: bool = True,
-        norm_topk_prob: bool = True,
-        **kwargs,
-    ):
+    def __init__(self, hidden_size=768, num_hidden_layers=8, use_moe=False, **kwargs):
         super().__init__(**kwargs)
-
-        self.dropout = dropout
-        self.bos_token_id = bos_token_id
-        self.eos_token_id = eos_token_id
-        self.hidden_act = hidden_act
         self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.max_position_embeddings = max_position_embeddings
-        self.num_attention_heads = num_attention_heads
         self.num_hidden_layers = num_hidden_layers
-        self.num_key_value_heads = num_key_value_heads
-        self.vocab_size = vocab_size
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.inference_rope_scaling = inference_rope_scaling
-        self.flash_attention = flash_attention
         self.use_moe = use_moe
-        self.num_experts_per_tok = num_experts_per_tok
-        self.n_routed_experts = n_routed_experts
-        self.n_shared_experts = n_shared_experts
-        self.seq_aux = seq_aux
-        self.norm_topk_prob = norm_topk_prob
-        self.aux_loss_alpha = aux_loss_alpha
-        self.scoring_func = scoring_func
-
-        self.rope_scaling = (
-            {
-                "beta_fast": 32,
-                "beta_slow": 1,
-                "factor": 16,
-                "original_max_position_embeddings": 2048,
-                "attention_factor": 1.0,
-                "type": "yarn",
-            }
-            if self.inference_rope_scaling
-            else None
-        )
-
-
+        self.dropout = kwargs.get("dropout", 0.0)
+        self.vocab_size = kwargs.get("vocab_size", 6400)
+        self.bos_token_id = kwargs.get("bos_token_id", 1)
+        self.eos_token_id = kwargs.get("eos_token_id", 2)
+        self.flash_attn = kwargs.get("flash_attn", True)
+        self.num_attention_heads = kwargs.get("num_attention_heads", 8)
+        self.num_key_value_heads = kwargs.get("num_key_value_heads", 4)
+        self.head_dim = kwargs.get("head_dim", self.hidden_size // self.num_attention_heads)
+        self.hidden_act = kwargs.get("hidden_act", 'silu')
+        self.intermediate_size = kwargs.get("intermediate_size", math.ceil(hidden_size * math.pi / 64) * 64)
+        self.max_position_embeddings = kwargs.get("max_position_embeddings", 32768)
+        self.rms_norm_eps = kwargs.get("rms_norm_eps", 1e-6)
+        self.rope_theta = kwargs.get("rope_theta", 1e6)
+        self.tie_word_embeddings = kwargs.get("tie_word_embeddings", True)
+        self.inference_rope_scaling = kwargs.get("inference_rope_scaling", False)
+        self.rope_scaling = {
+            "beta_fast": 32,
+            "beta_slow": 1,
+            "factor": 16,
+            "original_max_position_embeddings": 2048,
+            "attention_factor": 1.0,
+            "type": "yarn"
+        } if self.inference_rope_scaling else None
+        ### MoE specific configs (ignored if use_moe = False)
+        self.num_experts = kwargs.get("num_experts", 4)
+        self.num_experts_per_tok = kwargs.get("num_experts_per_tok", 1)
+        self.moe_intermediate_size = kwargs.get("moe_intermediate_size", self.intermediate_size)
+        self.norm_topk_prob = kwargs.get("norm_topk_prob", True)
+        self.router_aux_loss_coef = kwargs.get("router_aux_loss_coef", 5e-4)
 #################################################################
 # MiniMind Model
 #################################################################
@@ -190,7 +157,7 @@ class Attention(nn.Module):
         self.n_local_heads = config.num_attention_heads  # 此处由于是单卡，所以没有除以 world_size，保持和 num_attention_heads 一致
         self.n_local_kv_heads = self.num_key_value_heads
         self.n_repeats = self.n_local_heads // self.n_local_kv_heads
-        self.head_dim = config.hidden_size // config.num_attention_heads
+        self.head_dim = config.head_dim
         
         self.is_casual = True
         
@@ -302,10 +269,111 @@ class MiniMindBlock(nn.Module):
         return hidden_states, present_key_value
         
 
+class MiniMindModel(nn.Module):
+    def __init__(self, config: MiniMindConfig):
+        super().__init__()
 
+        self.config = config
+        self.vocab_size = config.vocab_size
+        self.num_hidden_layers = config.num_hidden_layers
+        self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+        self.dropout = nn.Dropout(config.dropout)
+        self.layers = nn.ModuleList([MiniMindBlock(i, config) for i in range(self.num_hidden_layers)])
+        self.norm = RMSNorm(config.hidden_size, eps = config.rms_norm_eps)
+        
+        # 预计算 RoPE 频率矩阵，缓存并注册为非训练张量（自动对齐设备/精度），persistent = False 设为不持久化以防占用磁盘权重体积
+        freq_cos, freq_sin = precompute_freqs_cis(config.head_dim, end = config.max_position_embeddings, rope_base = config.rope_theta, rope_scaling = config.rope_scaling)
+        self.register_buffer("freq_cos", freq_cos, persistent = False)
+        self.register_buffer("freq_sin", freq_sin, persistent = False)
+
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None, 
+            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+            use_cache: bool = False,
+            **kwargs
+    ):
+        # input_ids: [batch_size, seq_len]
+        bsz, seq_len = input_ids.shape
+
+        if hasattr(past_key_values, "layers"):
+            past_key_values = None
+
+        past_key_values = past_key_values if past_key_values is not None else [None] * len(self.layers)
+
+        # 计算start_pos以确定当前输入序列在整体上下文中的起始位置，这对于正确应用 RoPE 位置编码非常重要。
+        # start_pos 的计算方式是检查 past_key_values 中第一个元素（对应第一层）的键向量的形状，如果存在，则取其序列长度（shape[1]），否则默认为 0。这意味着如果有过去的键值对缓存，start_pos 将反映已经处理过的序列长度，从而确保新的输入序列能够正确地接续在之前的上下文之后进行位置编码。
+        start_pos = past_key_values[0][0].shape[1] if past_key_values[0] is not None else 0
+
+        # Embedding + dropout
+        hidden_states = self.dropout(self.embed_tokens(input_ids))
+
+        # position_embeddings
+        position_embeddings = (self.freq_cos[start_pos : start_pos + seq_len], self.freq_sin[start_pos : start_pos + seq_len])
+
+        presents = []
+        for layer, past_key_value in zip(self.layers, past_key_values):
+            hidden_states, present = layer(
+                hidden_states, 
+                position_embeddings = position_embeddings,
+                past_key_value = past_key_value,
+                use_cache = use_cache,
+                attention_mask = attention_mask,
+            )
+            presents.append(present)
+            
+        hidden_states = self.norm(hidden_states)
+
+        aux_loss = sum([l.mlp.aux_loss for l in self.layers if isinstance(l.mlp, MoEFeedForward)], hidden_states.new_zeros(1).squeze())
+
+        return hidden_states, presents, aux_loss
 
         
+class MiniMindForCausalLM(PretrainedConfig, GenerationMixin):
+    config_class = MiniMindConfig
 
+    def __init__(self, config: MiniMindConfig):
+        super().__init__(config)
+        self.model = MiniMindModel(config)
+        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias = False)
+        self.model.embed_tokens.weight = self.lm_head.weight if config.tie_word_embeddings else self.model.embed_tokens.weight
 
+    def forward(
+            self,
+            input_ids: Optional[torch.Tensor] = None,
+            attention_mask: Optional[torch.Tensor] = None,
+            labels: Optional[torch.Tensor] = None,
+            past_key_values: Optional[List[Tuple[torch.Tensor, torch.Tensor]]] = None,
+            use_cache: bool = False,
+            logits_to_keep: Union[int, torch.Tensor] = 0, 
+            **kwargs
+    ):
+        hidden_states, past_key_values, aux_loss = self.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            past_key_values=past_key_values,
+            use_cache=use_cache,
+        )
 
+        
+        # 动态计算切片：推理时常设为1仅切出最后一个Token，训练时设为0保留全量文本
+        slice_indices = slice(-logits_to_keep, None) if isinstance(logits_to_keep, int) else logits_to_keep
+        # 仅对切片后的特征执行线性投影，避免在推理阶段对历史Token做重复计算，极大地压缩显存与算力开销
+        logits = self.lm_head(hidden_states[:, slice_indices, :])
 
+        # 计算交叉熵损失
+        loss = None
+        if labels is not None:
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            loss = F.cross_entropy(shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1), ignore_index=-100)
+
+        output = CausalLMOutputWithPast(
+            loss=loss,
+            logits=logits,
+            past_key_values=past_key_values,
+            hidden_states=hidden_states,
+        )
+        output.aux_loss = aux_loss
+        return output
