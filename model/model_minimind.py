@@ -3,10 +3,10 @@ import torch
 import torch.nn.functional as F
 import torch.nn as nn
 from typing import Optional, Tuple, List, Union
-from transformers import PretrainedConfig
+from transformers import PreTrainedModel, GenerationMixin, PretrainedConfig
 from transformers.activations import ACT2FN
-from transformers.generation_utils import GenerationMixin
 from transformers.modeling_outputs import CausalLMOutputWithPast
+from transformers.modeling_outputs import MoeCausalLMOutputWithPast
 
 #################################################################
 # MiniMind Config
