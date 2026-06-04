@@ -4,63 +4,50 @@ import sys
 __package__ = "trainer"
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-import argparse  # 命令行参数解析
-import time  # 时间统计
-import warnings  # 警告控制
+import datasets  # noqa: F401  # Windows pyarrow/torch DLL conflict workaround (issue #771)
+import argparse
+import time
+import warnings
 import torch
-import torch.distributed as dist  # 分布式训练支持
-from contextlib import nullcontext  # 上下文管理器
-from torch import optim  # 优化器
-from torch.nn.parallel import DistributedDataParallel  # 分布式数据并行
-from torch.utils.data import DataLoader, DistributedSampler  # 数据加载器
-
+import torch.distributed as dist
+from contextlib import nullcontext
+from torch import optim, nn
+from torch.nn.parallel import DistributedDataParallel
+from torch.utils.data import DataLoader, DistributedSampler
 from model.model_minimind import MiniMindConfig
 from dataset.lm_dataset import PretrainDataset
 from trainer.trainer_utils import get_lr, Logger, is_main_process, lm_checkpoint, init_distributed_mode, setup_seed, init_model, SkipBatchSampler
 
-# 忽略警告信息，保持输出清洁
 warnings.filterwarnings('ignore')
 
 
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
-    start_time = time.time()    # 记录当前 Epoch 的启动时间戳
-    last_step = start_step      # 初始化追踪器，用于断点续训时精准记录最后完成的 Step
-
-    # 从断点的下一步（start_step + 1）开始遍历数据加载器，确保进度条数字完全连续
+    start_time = time.time()
+    last_step = start_step
     for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        # 搬运到 GPU
         input_ids = input_ids.to(args.device)
         labels = labels.to(args.device)
-
-        last_step = step        # 更新当前成功步数
-
-        # 【动态学习率】根据全局总进度，计算出当前 Step 模型应该使用的精准余弦退火学习率
+        last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
-        # 【AMP 自动混合精度】开启自动档：高能耗矩阵乘法自动降级为16位跑省显存，敏感算子保持32位保精度
         with autocast_ctx:
             res = model(input_ids, labels=labels)
             loss = res.loss + res.aux_loss
             loss = loss / args.accumulation_steps
 
-        # 【AMP 防下溢反向传播】先将 Loss 暴力充气放大（如65536倍）再 backward，防止微小梯度在16位下变0死掉
         scaler.scale(loss).backward()
 
         if step % args.accumulation_steps == 0:
-            # 还原：更新前执行放气阀，将所有梯度除以放大系数，恢复真实数学大小
             scaler.unscale_(optimizer)
-
-            # 梯度裁剪
             torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
 
             scaler.step(optimizer)
             scaler.update()
 
-            # 【内存级清空】不覆写为0，而是直接在底层把梯度内存地址彻底抹除释放（变为None），疯狂压榨腾出连续显存
             optimizer.zero_grad(set_to_none=True)
-        
+
         if step % args.log_interval == 0 or step == iters:
             spend_time = time.time() - start_time
             current_loss = loss.item() * args.accumulation_steps
@@ -120,7 +107,6 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # ========== 1. 初始化环境和随机种子 ==========
-    
     local_rank = init_distributed_mode()
     if dist.is_initialized(): args.device = f"cuda:{local_rank}"
     setup_seed(42 + (dist.get_rank() if dist.is_initialized() else 0))

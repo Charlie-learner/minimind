@@ -332,12 +332,14 @@ class MiniMindModel(nn.Module):
         
 class MiniMindForCausalLM(PretrainedConfig, GenerationMixin):
     config_class = MiniMindConfig
+    _tied_weights_keys = {"lm_head.weight": "model.embed_tokens.weight"}
 
-    def __init__(self, config: MiniMindConfig):
-        super().__init__(config)
-        self.model = MiniMindModel(config)
-        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias = False)
-        self.model.embed_tokens.weight = self.lm_head.weight if config.tie_word_embeddings else self.model.embed_tokens.weight
+    def __init__(self, config: MiniMindConfig = None):
+        self.config = config or MiniMindConfig()
+        super().__init__(self.config)
+        self.model = MiniMindModel(self.config)
+        self.lm_head = nn.Linear(self.config.hidden_size, self.config.vocab_size, bias = False)
+        self.model.embed_tokens.weight = self.lm_head.weight if self.config.tie_word_embeddings else self.model.embed_tokens.weight
 
     def forward(
             self,
