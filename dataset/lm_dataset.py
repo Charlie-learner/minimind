@@ -25,7 +25,7 @@ class PretrainDataset(Dataset):
         # 使用 Hugging Face datasets 的惰性加载，避免一次性读入大文件
         # self.samples：加载出来的结果。它不是普通的 Python 列表，而是一个虚拟的内存映射对象。
         # 即使你的 JSON 文件有 100GB 大，这行代码也能瞬间跑完，因为它不会把数据全读进内存，而是用到哪一行才去硬盘读哪一行，极其省内存。
-        self.samples = load_dataset("json", data_file=data_path, split="train")
+        self.samples = load_dataset("json", data_files=data_path, split="train")
 
     def __len__(self):
         return len(self.samples)

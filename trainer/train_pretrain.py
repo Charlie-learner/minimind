@@ -24,9 +24,18 @@ warnings.filterwarnings('ignore')
 def train_epoch(epoch, loader, iters, start_step=0, wandb=None):
     start_time = time.time()
     last_step = start_step
-    for step, (input_ids, labels) in enumerate(loader, start=start_step + 1):
-        input_ids = input_ids.to(args.device)
-        labels = labels.to(args.device)
+    
+    # 用 batch 取值防止 loader 返回过多参数导致解包失败
+    for step, batch in enumerate(loader, start=start_step + 1):
+        # 不管 batch 里有几个值，我们只通过名字把我们需要的东西精准抓出来
+        if isinstance(batch, dict):
+            input_ids = batch['input_ids'].to(args.device)
+            labels = batch['labels'].to(args.device)
+        else:
+            # 如果它依然是元组/列表，我们按索引安全拿前两个
+            input_ids = batch[0].to(args.device)
+            labels = batch[1].to(args.device)
+        
         last_step = step
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
