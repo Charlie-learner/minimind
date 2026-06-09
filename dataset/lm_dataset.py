@@ -217,10 +217,7 @@ class SFTDataset(Dataset):
         #     print(f"{i:3d}: X={self.tokenizer.decode([x])!r:16s} ---> Y={self.tokenizer.decode([input_ids[i+1]])!r:16s} label={y}")
         # # ================
 
-        # ! 修正： 返回 attention_mask, 使 attention 层能屏蔽 padding token (原官方minimind仓库中没有这一步)
-        attenion_mask = (torch.tensor(input_ids, dtype=torch.long) != self.tokenizer.pad_token_id).long()
-
-        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long), attenion_mask
+        return torch.tensor(input_ids, dtype=torch.long), torch.tensor(labels, dtype=torch.long)
 
 
 
